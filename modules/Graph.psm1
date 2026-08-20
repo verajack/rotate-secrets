@@ -1,68 +1,6 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Get-GraphAccessToken {
-
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$TenantId,
-
-        [Parameter(Mandatory)]
-        [string]$AutomationClientId,
-
-        [Parameter(Mandatory)]
-        [string]$AutomationClientSecret
-    )
-
-    Write-Host "Authenticating to Microsoft Graph..."
-
-    $TokenUri =
-        "https://login.microsoftonline.com/${TenantId}/oauth2/v2.0/token"
-
-    $TokenBody = @{
-        client_id     = $AutomationClientId
-        client_secret = $AutomationClientSecret
-        scope         = "https://graph.microsoft.com/.default"
-        grant_type    = "client_credentials"
-    }
-
-    try {
-
-        $Response =
-            Invoke-RestMethod `
-                -Method POST `
-                -Uri $TokenUri `
-                -Body $TokenBody `
-                -ContentType "application/x-www-form-urlencoded"
-
-        if ([string]::IsNullOrWhiteSpace($Response.access_token)) {
-            throw "Microsoft Graph did not return an access token."
-        }
-
-        Write-Host "Microsoft Graph authentication successful."
-        Write-Host ""
-
-        return $Response.access_token
-    }
-    catch {
-
-        if ($_.Exception.Message -eq "Microsoft Graph did not return an access token.") {
-            throw
-        }
-
-        if ($_.ErrorDetails.Message) {
-            throw "Graph authentication failed: $($_.ErrorDetails.Message)"
-        }
-
-        throw "Graph authentication failed: $($_.Exception.Message)"
-    }
-    finally {
-        $TokenBody.client_secret = $null
-    }
-}
-
-
 function Get-GraphHeaders {
 
     [CmdletBinding()]
@@ -226,7 +164,6 @@ function Remove-AppRegistrationSecret {
 }
 
 Export-ModuleMember -Function `
-    Get-GraphAccessToken, `
     Get-GraphHeaders, `
     Get-ApplicationByClientId, `
     Show-AppCredentials, `
