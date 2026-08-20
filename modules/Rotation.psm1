@@ -160,7 +160,10 @@ function Invoke-SecretRotationTransaction {
                     $RollbackStatus = "Failed"
 
                     Write-Host ""
-                    Write-Error "CRITICAL: Automatic rollback failed for credential $($NewCredential.keyId). Manual cleanup is required. $RollbackError"
+                    # Do not emit an error/warning record here. Automation runners and
+                    # test harnesses may promote those streams to terminating errors.
+                    # Return the manual-cleanup condition as structured transaction data.
+                    Write-Host "CRITICAL: Automatic rollback failed for credential $($NewCredential.keyId). Manual cleanup is required. $RollbackError"
 
                     $ErrorMessage =
                         "$ErrorMessage Automatic rollback FAILED for credential $($NewCredential.keyId): $RollbackError"
