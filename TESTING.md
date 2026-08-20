@@ -1,25 +1,49 @@
-# Pester tests
+# Step 4 - External configuration
 
-These tests mock Microsoft Graph and Azure Key Vault operations. They do not create, update, or delete real Azure credentials or Key Vault secrets.
+This step removes environment-specific Tenant ID and automation App ID values from the script.
+No secret values are stored in the settings file.
 
-## Install Pester (if needed)
+## Setup
 
-```powershell
-Get-Module -ListAvailable Pester
-```
-
-If Pester 5 is not installed:
+Copy the example settings file:
 
 ```powershell
-Install-Module Pester -Scope CurrentUser -Force
+Copy-Item ./config/settings.example.psd1 ./config/settings.psd1
 ```
 
-## Run
+Edit `config/settings.psd1` and set the lab values for `TenantId` and `AutomationClientId`.
+Keep `config/settings.psd1` out of Git. Add the supplied ignore snippet to your existing `.gitignore`.
 
-From the repository root:
+The automation secret is still supplied through:
+
+```powershell
+$env:AUTOMATION_CLIENT_SECRET
+```
+
+Optional environment overrides are also supported:
+
+```powershell
+$env:AZURE_TENANT_ID
+$env:AUTOMATION_CLIENT_ID
+```
+
+They override the corresponding values in `settings.psd1`.
+
+## Unit tests
 
 ```powershell
 Invoke-Pester ./tests/Rotation.Tests.ps1 -Output Detailed
 ```
 
-Expected result: 6 tests passed, 0 failed.
+Expected: 6 passed, 0 failed.
+
+## Safe behaviour check
+
+```powershell
+./rotate_secrets_step4.ps1 `
+    -Mode Rotate `
+    -InputFile ./customers.csv `
+    -WhatIf
+```
+
+No Azure credential or Key Vault secret should be changed in `-WhatIf` mode.
