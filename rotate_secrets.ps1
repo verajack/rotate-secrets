@@ -275,6 +275,37 @@ function New-AppRegistrationSecret {
 }
 
 
+function Remove-AppRegistrationSecret {
+
+    param(
+        [Parameter(Mandatory)]
+        [string]$ObjectId,
+
+        [Parameter(Mandatory)]
+        [string]$KeyId,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers
+    )
+
+    $Uri =
+        "https://graph.microsoft.com/v1.0/applications/${ObjectId}/removePassword"
+
+    $Body = @{
+        keyId = $KeyId
+    } |
+        ConvertTo-Json
+
+    Invoke-RestMethod `
+        -Method POST `
+        -Uri $Uri `
+        -Headers $Headers `
+        -Body $Body
+
+    Write-Host "Rollback successfully removed credential $KeyId"
+}
+
+
 function Test-AzureCliLogin {
 
     try {
@@ -284,7 +315,9 @@ function Test-AzureCliLogin {
                 --output json `
                 --only-show-errors 2>$null
 
-        if (-not $AccountJson) {
+        $AzExitCode = $LASTEXITCODE
+
+        if ($AzExitCode -ne 0 -or -not $AccountJson) {
             return $false
         }
 
@@ -320,11 +353,14 @@ function Test-KeyVaultExists {
 
     try {
 
-        $null =
-            az keyvault show `
-                --name $VaultName `
-                --output none `
-                --only-show-errors
+        az keyvault show `
+            --name $VaultName `
+            --output none `
+            --only-show-errors 2>$null
+
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
 
         return $true
 
@@ -352,11 +388,8 @@ function Set-CustomerKeyVaultSecret {
     #
     # IMPORTANT:
     #
-    # We pass the secret through stdin rather than including it in
-    # normal console output.
-    #
-    # The az command receives the secret as its argument internally,
-    # but the script NEVER writes it to our log.
+    # The secret value is held in memory and passed directly to Azure CLI.
+    # The script NEVER writes the secret value to console output or audit logs.
     #
 
     $Result =
@@ -366,6 +399,12 @@ function Set-CustomerKeyVaultSecret {
             --value $SecretValue `
             --output json `
             --only-show-errors
+
+    $AzExitCode = $LASTEXITCODE
+
+    if ($AzExitCode -ne 0) {
+        throw "Azure CLI Key Vault secret update failed with exit code $AzExitCode."
+    }
 
     if (-not $Result) {
         throw "Azure CLI returned no result from Key Vault secret update."
@@ -393,12 +432,19 @@ function Get-KeyVaultSecretMetadata {
             --output json `
             --only-show-errors
 
+    $AzExitCode = $LASTEXITCODE
+
+    if ($AzExitCode -ne 0) {
+        throw "Azure CLI failed to retrieve Key Vault secret metadata with exit code $AzExitCode."
+    }
+
     if (-not $Result) {
         throw "Unable to retrieve Key Vault secret metadata."
     }
 
     return ($Result | ConvertFrom-Json)
 }
+
 
 # ============================================================
 # LOAD INPUT
@@ -481,6 +527,7 @@ foreach ($Customer in $EnabledCustomers) {
     Write-Host "------------------------------------------------"
 
     $NewCredential = $null
+    $KeyVaultWriteSucceeded = $false
 
     try {
 
@@ -490,6 +537,10 @@ foreach ($Customer in $EnabledCustomers) {
 
         if ([string]::IsNullOrWhiteSpace($Customer.ApplicationId)) {
             throw "ApplicationId is missing."
+        }
+
+        if ($Customer.ApplicationId -eq $AutomationClientId) {
+            throw "Refusing to rotate the automation App Registration itself ('$AutomationClientId'). Use a separate target App Registration for rotation testing."
         }
 
         # ----------------------------------------------------
@@ -625,6 +676,8 @@ foreach ($Customer in $EnabledCustomers) {
                 -SecretName $Customer.KeyVaultSecretName `
                 -SecretValue $NewCredential.secretText
 
+        $KeyVaultWriteSucceeded = $true
+
         Write-Host "Key Vault update returned successfully."
 
         # ----------------------------------------------------
@@ -684,13 +737,43 @@ foreach ($Customer in $EnabledCustomers) {
 
         if ($NewCredential -and $NewCredential.keyId) {
 
-            Write-Host ""
-            Write-Host "WARNING:"
-            Write-Host "A new App Registration credential may have been created."
-            Write-Host "Its Key ID is:"
-            Write-Host $NewCredential.keyId
-            Write-Host ""
-            Write-Host "Do NOT remove old credentials."
+            if (-not $KeyVaultWriteSucceeded) {
+
+                Write-Host ""
+                Write-Warning "A new App Registration credential was created, but the Key Vault write did not complete."
+                Write-Warning "Attempting automatic rollback of credential $($NewCredential.keyId)..."
+
+                try {
+
+                    Remove-AppRegistrationSecret `
+                        -ObjectId $Application.id `
+                        -KeyId $NewCredential.keyId `
+                        -Headers $GraphHeaders
+
+                    Write-Warning "Automatic rollback completed successfully."
+
+                    $ErrorMessage =
+                        "$ErrorMessage Automatic rollback removed credential $($NewCredential.keyId)."
+                }
+                catch {
+
+                    $RollbackError =
+                        $_.Exception.Message
+
+                    Write-Host ""
+                    Write-Error "CRITICAL: Automatic rollback failed for credential $($NewCredential.keyId). Manual cleanup is required. $RollbackError"
+
+                    $ErrorMessage =
+                        "$ErrorMessage Automatic rollback FAILED for credential $($NewCredential.keyId): $RollbackError"
+                }
+            }
+            else {
+
+                Write-Host ""
+                Write-Warning "The Key Vault write completed before the later failure."
+                Write-Warning "The new credential has been retained intentionally."
+                Write-Warning "Do NOT delete credential $($NewCredential.keyId) until the Key Vault version has been verified."
+            }
         }
 
         Write-AuditLog `
@@ -703,6 +786,7 @@ foreach ($Customer in $EnabledCustomers) {
             -CredentialKeyId $(if ($NewCredential) { $NewCredential.keyId } else { "" }) `
             -Message $ErrorMessage
     }
+
     finally {
 
         if ($NewCredential) {
@@ -737,3 +821,4 @@ if ($Mode -eq "Rotate") {
     Write-Host "Validation and retirement remain separate stages."
     Write-Host ""
 }
+
