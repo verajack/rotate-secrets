@@ -1,3 +1,4 @@
 *.old
 logs/
 customers.csv
+config/settings.psd1
