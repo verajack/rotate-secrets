@@ -69,18 +69,75 @@ function Get-AzureCliContext {
 }
 
 
+function Connect-ManagedIdentityAzureCli {
+
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ExpectedTenantId,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$ManagedIdentityClientId,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$SubscriptionId
+    )
+
+    $LoginArguments = @(
+        "login",
+        "--identity",
+        "--output", "none",
+        "--only-show-errors"
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ManagedIdentityClientId)) {
+        $LoginArguments += @(
+            "--client-id", $ManagedIdentityClientId
+        )
+    }
+
+    $LoginResult =
+        Invoke-AzureCliCommand `
+            -Arguments $LoginArguments
+
+    if ($LoginResult.ExitCode -ne 0) {
+        throw "Managed Identity Azure CLI login failed: $($LoginResult.Output -join ' ')"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SubscriptionId)) {
+
+        $SubscriptionResult =
+            Invoke-AzureCliCommand `
+                -Arguments @(
+                    "account", "set",
+                    "--subscription", $SubscriptionId,
+                    "--only-show-errors"
+                )
+
+        if ($SubscriptionResult.ExitCode -ne 0) {
+            throw "Managed Identity login succeeded but subscription selection failed: $($SubscriptionResult.Output -join ' ')"
+        }
+    }
+
+    return Get-AzureCliContext -ExpectedTenantId $ExpectedTenantId
+}
+
+
 function Get-AutomationGraphAccessToken {
 
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet("ClientSecret", "AzureCli")]
+        [ValidateSet("ClientSecret", "AzureCli", "ManagedIdentity")]
         [string]$AuthenticationMode,
 
         [Parameter(Mandatory)]
         [string]$TenantId,
 
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
         [string]$AutomationClientId,
 
         [Parameter(Mandatory = $false)]
@@ -90,13 +147,14 @@ function Get-AutomationGraphAccessToken {
 
     Write-Host "Authenticating to Microsoft Graph using $AuthenticationMode..."
 
-    if ($AuthenticationMode -eq "AzureCli") {
+    if ($AuthenticationMode -in @("AzureCli", "ManagedIdentity")) {
 
         $Result =
             Invoke-AzureCliCommand `
                 -Arguments @(
                     "account", "get-access-token",
                     "--resource-type", "ms-graph",
+                    "--tenant", $TenantId,
                     "--query", "accessToken",
                     "--output", "tsv",
                     "--only-show-errors"
@@ -117,6 +175,10 @@ function Get-AutomationGraphAccessToken {
         Write-Host ""
 
         return $AccessToken
+    }
+
+    if ([string]::IsNullOrWhiteSpace($AutomationClientId)) {
+        throw "ClientSecret authentication requires AutomationClientId."
     }
 
     if ([string]::IsNullOrWhiteSpace($AutomationClientSecret)) {
@@ -170,4 +232,5 @@ function Get-AutomationGraphAccessToken {
 
 Export-ModuleMember -Function `
     Get-AzureCliContext, `
+    Connect-ManagedIdentityAzureCli, `
     Get-AutomationGraphAccessToken

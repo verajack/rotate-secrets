@@ -1,48 +1,52 @@
-# Step 5 testing
+# Step 6 testing
 
 ## Goal
 
-Support two authentication modes without changing the tested rotation transaction:
+Keep the existing rotation transaction unchanged while supporting three explicit authentication modes:
 
-- `ClientSecret` for local/lab compatibility.
-- `AzureCli` for production/workload identity. The Azure CLI context may be established by managed identity or OIDC/workload federation.
+- `ClientSecret`: local/lab fallback.
+- `AzureCli`: local development or a federated CI identity already established in Azure CLI.
+- `ManagedIdentity`: Azure-hosted production mode; the script explicitly runs `az login --identity`.
 
-## Local regression test
+## Unit tests
 
-Keep `AuthenticationMode = "ClientSecret"` in `config/settings.psd1`, load `AUTOMATION_CLIENT_SECRET`, then run:
+Run:
 
 ```powershell
 Invoke-Pester ./tests -Output Detailed
-
-./rotate_secrets_step5.ps1 `
-    -Mode Rotate `
-    -InputFile ./customers.csv `
-    -WhatIf
 ```
 
-## Azure CLI identity test on the Mac
+Step 6 adds Managed Identity login tests in addition to the existing authentication and rotation tests. These are mocked and do not log into Azure or change real credentials.
 
-For a non-production smoke test, set `AuthenticationMode = "AzureCli"`. Your current `az login` user context will be used to obtain the Graph token. No `AUTOMATION_CLIENT_SECRET` is required.
+## Local regression test
+
+Keep `AuthenticationMode = "AzureCli"` on the Mac and use the existing interactive `az login` only for the smoke test:
 
 ```powershell
-Remove-Item Env:AUTOMATION_CLIENT_SECRET -ErrorAction SilentlyContinue
-
-./rotate_secrets_step5.ps1 `
+./rotate_secrets_step6.ps1 `
     -Mode Rotate `
     -InputFile ./customers.csv `
     -WhatIf
 ```
 
-This proves the code path, but a human `az login` is not the intended production identity.
+This should behave like Step 5.
 
-## Production managed identity
+## Managed Identity mode
 
-On an Azure compute resource with a system-assigned managed identity:
+Do not test `AuthenticationMode = "ManagedIdentity"` on the Mac. `az login --identity` requires an Azure resource with an enabled managed identity.
 
-```bash
-az login --identity
+Once an Azure host exists and permissions are bootstrapped, configure:
+
+```powershell
+AuthenticationMode      = "ManagedIdentity"
+ManagedIdentityClientId = ""  # system-assigned, or UAMI client ID
+SubscriptionId          = "<subscription-guid>"
 ```
 
-For a user-assigned managed identity, use its client/object/resource ID with `az login --identity`.
+Then run `-WhatIf` on that host first. A production Managed Identity test is complete only when:
 
-Set `AuthenticationMode = "AzureCli"`. The script then gets its Microsoft Graph token from the authenticated Azure CLI context and uses the same CLI identity for Key Vault operations.
+1. Azure CLI reports the managed identity/service principal context.
+2. Microsoft Graph authentication succeeds.
+3. Customer app discovery succeeds.
+4. Key Vault pre-flight succeeds on a real `Rotate -WhatIf`/controlled test.
+5. No `AUTOMATION_CLIENT_SECRET` exists in the process environment.
