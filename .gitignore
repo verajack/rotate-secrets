@@ -9,3 +9,7 @@ config/settings.psd1
 # Local script backups
 *.bak
 rotate_secrets.ps1.pre-hardened
+
+# Generated prod-mimic lab data
+customers-prod-mimic.csv
+prod-mimic-manifest.json
