@@ -22,10 +22,6 @@ $ErrorActionPreference = "Stop"
 $TenantId = "cd57534e-6698-4d73-aeea-b6257e8d0b62"
 $AutomationClientId = "cc8d2e70-4e17-47d4-8dbe-4acbb0ead403"
 
-# LAB ONLY.
-# Eventually replace this with managed identity / secure injection.
-#$AutomationClientSecret = $env:AUTOMATION_CLIENT_SECRET
-
 # Prefer an injected environment variable if one exists.
 $AutomationClientSecret = $env:AUTOMATION_CLIENT_SECRET
 
@@ -45,12 +41,14 @@ if ([string]::IsNullOrWhiteSpace($AutomationClientSecret) -and $IsMacOS) {
     }
 }
 
-
 # Output
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-
 $LogDirectory = Join-Path $PSScriptRoot "logs"
 $LogFile = Join-Path $LogDirectory "rotation-$Timestamp.csv"
+$SummaryFile = Join-Path $LogDirectory "summary-$Timestamp.csv"
+
+# Batch result collection. One row is added for every CSV customer.
+$script:BatchResults = [System.Collections.Generic.List[object]]::new()
 
 # ============================================================
 # INITIAL CHECKS
@@ -75,18 +73,16 @@ if ([string]::IsNullOrWhiteSpace($AutomationClientSecret)) {
 if ($ValidityMonths -lt 1 -or $ValidityMonths -gt 24) {
     throw "ValidityMonths must be between 1 and 24."
 }
+
 if (
     (($Mode -eq "Rotate") -and -not $WhatIfPreference) -or
     ($Mode -in @("Validate", "Retire"))
 ) {
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-
         throw @"
 Azure CLI ('az') is not available.
 
-This script uses Azure CLI for Key Vault updates.
-
-Azure Cloud Shell includes Azure CLI.
+This script uses Azure CLI for Key Vault operations.
 
 On this machine verify with:
 
@@ -112,21 +108,89 @@ function Write-AuditLog {
         [string]$Message
     )
 
-    [PSCustomObject]@{
-        TimestampUtc       = (Get-Date).ToUniversalTime().ToString("o")
-        CustomerName       = $CustomerName
-        ApplicationId      = $ApplicationId
-        KeyVaultName       = $KeyVaultName
-        KeyVaultSecretName = $KeyVaultSecretName
-        Action             = $Action
-        Status             = $Status
-        CredentialKeyId    = $CredentialKeyId
-        Message            = $Message
-    } |
-        Export-Csv `
-            -Path $LogFile `
-            -Append `
-            -NoTypeInformation
+    try {
+        [PSCustomObject]@{
+            TimestampUtc       = (Get-Date).ToUniversalTime().ToString("o")
+            CustomerName       = $CustomerName
+            ApplicationId      = $ApplicationId
+            KeyVaultName       = $KeyVaultName
+            KeyVaultSecretName = $KeyVaultSecretName
+            Action             = $Action
+            Status             = $Status
+            CredentialKeyId    = $CredentialKeyId
+            Message            = $Message
+        } |
+            Export-Csv `
+                -Path $LogFile `
+                -Append `
+                -NoTypeInformation `
+                -WhatIf:$false
+    }
+    catch {
+        Write-Warning "Unable to write audit log entry: $($_.Exception.Message)"
+    }
+}
+
+
+function Add-BatchResult {
+
+    param(
+        [Parameter(Mandatory)]
+        [int]$RowNumber,
+
+        [Parameter(Mandatory)]
+        [string]$CustomerName,
+
+        [Parameter(Mandatory)]
+        [string]$Stage,
+
+        [Parameter(Mandatory)]
+        [string]$Status,
+
+        [Parameter(Mandatory)]
+        [string]$Details,
+
+        [string]$CredentialKeyId = ""
+    )
+
+    $script:BatchResults.Add(
+        [PSCustomObject]@{
+            Row             = $RowNumber
+            Customer        = $CustomerName
+            Stage           = $Stage
+            Status          = $Status
+            CredentialKeyId = $CredentialKeyId
+            Details         = $Details
+        }
+    ) | Out-Null
+}
+
+
+function ConvertTo-EnabledFlag {
+
+    param(
+        [AllowNull()]
+        [string]$Value,
+
+        [Parameter(Mandatory)]
+        [int]$RowNumber
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        throw "CSV row $RowNumber has a blank Enabled value. Allowed values: true, false, yes, no, 1, 0."
+    }
+
+    switch ($Value.Trim().ToLowerInvariant()) {
+        "true"  { return $true }
+        "yes"   { return $true }
+        "1"     { return $true }
+        "false" { return $false }
+        "no"    { return $false }
+        "0"     { return $false }
+        default {
+            throw "CSV row $RowNumber has invalid Enabled value '$Value'. Allowed values: true, false, yes, no, 1, 0."
+        }
+    }
 }
 
 
@@ -145,17 +209,14 @@ function Get-GraphAccessToken {
     }
 
     try {
-
         $Response =
             Invoke-RestMethod `
                 -Method POST `
                 -Uri $TokenUri `
                 -Body $TokenBody `
                 -ContentType "application/x-www-form-urlencoded"
-
     }
     catch {
-
         if ($_.ErrorDetails.Message) {
             throw "Graph authentication failed: $($_.ErrorDetails.Message)"
         }
@@ -228,11 +289,9 @@ function Show-AppCredentials {
         $Application
     )
 
-    $Credentials =
-        @($Application.passwordCredentials)
+    $Credentials = @($Application.passwordCredentials)
 
     if ($Credentials.Count -eq 0) {
-
         Write-Host "No client secrets found."
         return
     }
@@ -255,20 +314,12 @@ function New-AppRegistrationSecret {
         [string]$ObjectId,
 
         [Parameter(Mandatory)]
-        [hashtable]$Headers,
-
-        [Parameter(Mandatory)]
-        [string]$CustomerName
+        [hashtable]$Headers
     )
 
-    $StartDate =
-        (Get-Date).ToUniversalTime()
-
-    $EndDate =
-        $StartDate.AddMonths($ValidityMonths)
-
-    $RotationName =
-        "rotation-$($StartDate.ToString('yyyyMMdd-HHmmss'))"
+    $StartDate = (Get-Date).ToUniversalTime()
+    $EndDate = $StartDate.AddMonths($ValidityMonths)
+    $RotationName = "rotation-$($StartDate.ToString('yyyyMMdd-HHmmss'))"
 
     $Body = @{
         passwordCredential = @{
@@ -331,7 +382,6 @@ function Remove-AppRegistrationSecret {
 function Test-AzureCliLogin {
 
     try {
-
         $AccountJson =
             az account show `
                 --output json `
@@ -343,9 +393,7 @@ function Test-AzureCliLogin {
             return $false
         }
 
-        $Account =
-            $AccountJson |
-            ConvertFrom-Json
+        $Account = $AccountJson | ConvertFrom-Json
 
         if (-not $Account.id) {
             return $false
@@ -356,11 +404,14 @@ function Test-AzureCliLogin {
         Write-Host "Tenant:       $($Account.tenantId)"
         Write-Host ""
 
-        return $true
+        if ("$($Account.tenantId)" -ne "$TenantId") {
+            Write-Warning "Azure CLI tenant does not match the configured Microsoft Graph tenant."
+            return $false
+        }
 
+        return $true
     }
     catch {
-
         return $false
     }
 }
@@ -374,7 +425,6 @@ function Test-KeyVaultExists {
     )
 
     try {
-
         az keyvault show `
             --name $VaultName `
             --output none `
@@ -385,10 +435,8 @@ function Test-KeyVaultExists {
         }
 
         return $true
-
     }
     catch {
-
         return $false
     }
 }
@@ -397,38 +445,35 @@ function Test-KeyVaultExists {
 function Set-CustomerKeyVaultSecret {
 
     param(
-    [Parameter(Mandatory)]
-    [string]$VaultName,
+        [Parameter(Mandatory)]
+        [string]$VaultName,
 
-    [Parameter(Mandatory)]
-    [string]$SecretName,
+        [Parameter(Mandatory)]
+        [string]$SecretName,
 
-    [Parameter(Mandatory)]
-    [string]$SecretValue,
+        [Parameter(Mandatory)]
+        [string]$SecretValue,
 
-    [Parameter(Mandatory)]
-    [string]$CredentialKeyId,
+        [Parameter(Mandatory)]
+        [string]$CredentialKeyId,
 
-    [Parameter(Mandatory)]
-    [string]$CredentialDisplayName
+        [Parameter(Mandatory)]
+        [string]$CredentialDisplayName
     )
-    #
-    # IMPORTANT:
-    #
+
     # The secret value is held in memory and passed directly to Azure CLI.
-    # The script NEVER writes the secret value to console output or audit logs.
-    #
+    # It is never written to console output, the audit log or the summary file.
 
     $Result =
-    az keyvault secret set `
-        --vault-name $VaultName `
-        --name $SecretName `
-        --value $SecretValue `
-        --tags `
-            "CredentialKeyId=$CredentialKeyId" `
-            "CredentialDisplayName=$CredentialDisplayName" `
-        --output json `
-        --only-show-errors
+        az keyvault secret set `
+            --vault-name $VaultName `
+            --name $SecretName `
+            --value $SecretValue `
+            --tags `
+                "CredentialKeyId=$CredentialKeyId" `
+                "CredentialDisplayName=$CredentialDisplayName" `
+            --output json `
+            --only-show-errors
 
     $AzExitCode = $LASTEXITCODE
 
@@ -474,6 +519,7 @@ function Get-KeyVaultSecretMetadata {
 
     return ($Result | ConvertFrom-Json)
 }
+
 
 function Get-CustomerKeyVaultSecretValue {
 
@@ -528,7 +574,6 @@ function Test-CustomerClientSecret {
     }
 
     try {
-
         $Response =
             Invoke-RestMethod `
                 -Method POST `
@@ -537,7 +582,6 @@ function Test-CustomerClientSecret {
                 -ContentType "application/x-www-form-urlencoded"
     }
     catch {
-
         if ($_.ErrorDetails.Message) {
             throw "Customer credential validation failed: $($_.ErrorDetails.Message)"
         }
@@ -554,47 +598,177 @@ function Test-CustomerClientSecret {
 }
 
 # ============================================================
-# LOAD INPUT
+# LOAD AND PREFLIGHT INPUT
 # ============================================================
 
-$Customers =
-    @(Import-Csv -Path $InputFile)
+$Customers = @(Import-Csv -Path $InputFile)
 
 if ($Customers.Count -eq 0) {
     throw "No customer entries were found in '$InputFile'."
 }
 
-$EnabledCustomers =
-    @(
-        $Customers |
-        Where-Object {
-            $_.Enabled -match "^(true|yes|1)$"
+$RequiredHeaders = @(
+    "CustomerName",
+    "ApplicationId",
+    "KeyVaultName",
+    "KeyVaultSecretName",
+    "Enabled"
+)
+
+$ActualHeaders = @($Customers[0].PSObject.Properties.Name)
+$MissingHeaders = @($RequiredHeaders | Where-Object { $_ -notin $ActualHeaders })
+
+if ($MissingHeaders.Count -gt 0) {
+    throw "CSV preflight failed. Missing required column(s): $($MissingHeaders -join ', ')."
+}
+
+$NormalizedCustomers = [System.Collections.Generic.List[object]]::new()
+$PreflightErrors = [System.Collections.Generic.List[string]]::new()
+
+for ($Index = 0; $Index -lt $Customers.Count; $Index++) {
+
+    $Source = $Customers[$Index]
+    $RowNumber = $Index + 2
+
+    try {
+        $CustomerName = if ($null -eq $Source.CustomerName) { "" } else { "$($Source.CustomerName)".Trim() }
+        $ApplicationId = if ($null -eq $Source.ApplicationId) { "" } else { "$($Source.ApplicationId)".Trim() }
+        $KeyVaultName = if ($null -eq $Source.KeyVaultName) { "" } else { "$($Source.KeyVaultName)".Trim() }
+        $KeyVaultSecretName = if ($null -eq $Source.KeyVaultSecretName) { "" } else { "$($Source.KeyVaultSecretName)".Trim() }
+        $Enabled = ConvertTo-EnabledFlag -Value $Source.Enabled -RowNumber $RowNumber
+
+        if ([string]::IsNullOrWhiteSpace($CustomerName)) {
+            throw "CustomerName is missing."
         }
+
+        if ($Enabled) {
+            if ([string]::IsNullOrWhiteSpace($ApplicationId)) {
+                throw "ApplicationId is missing."
+            }
+
+            $ParsedApplicationId = [guid]::Empty
+            if (-not [guid]::TryParse($ApplicationId, [ref]$ParsedApplicationId)) {
+                throw "ApplicationId '$ApplicationId' is not a valid GUID."
+            }
+
+            $ApplicationId = $ParsedApplicationId.ToString()
+
+            if ($ApplicationId -eq $AutomationClientId) {
+                throw "ApplicationId is the automation App Registration itself. It cannot be used as a customer rotation target."
+            }
+
+            if ([string]::IsNullOrWhiteSpace($KeyVaultName)) {
+                throw "KeyVaultName is missing."
+            }
+
+            if ([string]::IsNullOrWhiteSpace($KeyVaultSecretName)) {
+                throw "KeyVaultSecretName is missing."
+            }
+        }
+
+        $NormalizedCustomers.Add(
+            [PSCustomObject]@{
+                RowNumber          = $RowNumber
+                CustomerName       = $CustomerName
+                ApplicationId      = $ApplicationId
+                KeyVaultName       = $KeyVaultName
+                KeyVaultSecretName = $KeyVaultSecretName
+                Enabled            = $Enabled
+            }
+        ) | Out-Null
+    }
+    catch {
+        $PreflightErrors.Add("Row ${RowNumber}: $($_.Exception.Message)") | Out-Null
+    }
+}
+
+if ($PreflightErrors.Count -gt 0) {
+    Write-Host ""
+    Write-Host "CSV PREFLIGHT FAILED"
+    $PreflightErrors | ForEach-Object { Write-Host " - $_" }
+    throw "No customer operations were started. Fix the CSV errors and run the command again."
+}
+
+$EnabledCustomers = @($NormalizedCustomers | Where-Object { $_.Enabled })
+$DisabledCustomers = @($NormalizedCustomers | Where-Object { -not $_.Enabled })
+
+$DuplicateApplicationGroups =
+    @(
+        $EnabledCustomers |
+        Group-Object { $_.ApplicationId.ToLowerInvariant() } |
+        Where-Object { $_.Count -gt 1 }
     )
+
+if ($DuplicateApplicationGroups.Count -gt 0) {
+    $DuplicateDetails =
+        $DuplicateApplicationGroups |
+        ForEach-Object {
+            $Rows = ($_.Group.RowNumber -join ", ")
+            "ApplicationId '$($_.Name)' appears on CSV rows $Rows"
+        }
+
+    throw "CSV preflight failed. Duplicate enabled ApplicationId entries detected: $($DuplicateDetails -join '; '). No customer operations were started."
+}
+
+$DuplicateDestinationGroups =
+    @(
+        $EnabledCustomers |
+        Group-Object {
+            "$($_.KeyVaultName.ToLowerInvariant())/$($_.KeyVaultSecretName.ToLowerInvariant())"
+        } |
+        Where-Object { $_.Count -gt 1 }
+    )
+
+if ($DuplicateDestinationGroups.Count -gt 0) {
+    $DuplicateDetails =
+        $DuplicateDestinationGroups |
+        ForEach-Object {
+            $Rows = ($_.Group.RowNumber -join ", ")
+            "Key Vault destination '$($_.Name)' appears on CSV rows $Rows"
+        }
+
+    throw "CSV preflight failed. Duplicate enabled Key Vault destinations detected: $($DuplicateDetails -join '; '). No customer operations were started."
+}
 
 Write-Host ""
 Write-Host "================================================"
 Write-Host " CompanyA App Registration Secret Rotation"
 Write-Host "================================================"
 Write-Host ""
-
 Write-Host "Mode:              $Mode"
 Write-Host "Input file:        $InputFile"
-Write-Host "Total entries:     $($Customers.Count)"
+Write-Host "Total entries:     $($NormalizedCustomers.Count)"
 Write-Host "Enabled entries:   $($EnabledCustomers.Count)"
+Write-Host "Disabled entries:  $($DisabledCustomers.Count)"
 Write-Host "Secret lifetime:   $ValidityMonths months"
+Write-Host "CSV preflight:     PASSED"
 Write-Host ""
+
+foreach ($Customer in $DisabledCustomers) {
+    Add-BatchResult `
+        -RowNumber $Customer.RowNumber `
+        -CustomerName $Customer.CustomerName `
+        -Stage $Mode `
+        -Status "DISABLED" `
+        -Details "Disabled in input file."
+
+    Write-AuditLog `
+        -CustomerName $Customer.CustomerName `
+        -ApplicationId $Customer.ApplicationId `
+        -KeyVaultName $Customer.KeyVaultName `
+        -KeyVaultSecretName $Customer.KeyVaultSecretName `
+        -Action $Mode `
+        -Status "Disabled" `
+        -CredentialKeyId "" `
+        -Message "Customer disabled in input file."
+}
 
 # ============================================================
 # GRAPH AUTHENTICATION
 # ============================================================
 
-$AccessToken =
-    Get-GraphAccessToken
-
-$GraphHeaders =
-    Get-GraphHeaders `
-        -AccessToken $AccessToken
+$AccessToken = Get-GraphAccessToken
+$GraphHeaders = Get-GraphHeaders -AccessToken $AccessToken
 
 # ============================================================
 # AZURE CLI CHECK
@@ -607,51 +781,32 @@ if (
     Write-Host "Checking Azure CLI authentication..."
 
     if (-not (Test-AzureCliLogin)) {
-
         throw @"
-Azure CLI is not authenticated.
+Azure CLI is not authenticated in the configured tenant.
 
-For a manual lab test run:
+For an operator-run session, authenticate first with:
 
-    az login
-
-Azure Cloud Shell should already have an authenticated Azure context.
+    az login --tenant $TenantId
 "@
     }
 }
 
 # ============================================================
-# PROCESS CUSTOMERS
+# PROCESS ENABLED CUSTOMERS
 # ============================================================
-
-$SuccessCount = 0
-$FailureCount = 0
-$SkippedCount = 0
 
 foreach ($Customer in $EnabledCustomers) {
 
     Write-Host ""
     Write-Host "------------------------------------------------"
-    Write-Host "Customer: $($Customer.CustomerName)"
+    Write-Host "Customer: $($Customer.CustomerName)  [CSV row $($Customer.RowNumber)]"
     Write-Host "------------------------------------------------"
 
+    $Application = $null
     $NewCredential = $null
     $KeyVaultWriteSucceeded = $false
 
     try {
-
-        # ----------------------------------------------------
-        # VALIDATE CSV ENTRY
-        # ----------------------------------------------------
-
-        if ([string]::IsNullOrWhiteSpace($Customer.ApplicationId)) {
-            throw "ApplicationId is missing."
-        }
-
-        if ($Customer.ApplicationId -eq $AutomationClientId) {
-            throw "Refusing to rotate the automation App Registration itself ('$AutomationClientId'). Use a separate target App Registration for rotation testing."
-        }
-
         # ----------------------------------------------------
         # FIND EXACT APP BY CLIENT ID
         # ----------------------------------------------------
@@ -666,18 +821,17 @@ foreach ($Customer in $EnabledCustomers) {
         Write-Host "Client ID: $($Application.appId)"
         Write-Host "Object ID: $($Application.id)"
         Write-Host ""
-
         Write-Host "Existing credentials:"
         Write-Host ""
 
-        Show-AppCredentials `
-            -Application $Application
+        Show-AppCredentials -Application $Application
 
         # ----------------------------------------------------
         # DISCOVER ONLY
         # ----------------------------------------------------
 
         if ($Mode -eq "Discover") {
+            $CredentialCount = @($Application.passwordCredentials).Count
 
             Write-AuditLog `
                 -CustomerName $Customer.CustomerName `
@@ -687,23 +841,16 @@ foreach ($Customer in $EnabledCustomers) {
                 -Action "Discover" `
                 -Status "Success" `
                 -CredentialKeyId "" `
-                -Message "Application located and credentials listed."
-/
-            $SuccessCount++
+                -Message "Application located and $CredentialCount credential(s) listed."
+
+            Add-BatchResult `
+                -RowNumber $Customer.RowNumber `
+                -CustomerName $Customer.CustomerName `
+                -Stage "Discover" `
+                -Status "SUCCESS" `
+                -Details "Application found; $CredentialCount credential(s)."
 
             continue
-        }
-
-        # ----------------------------------------------------
-        # VALIDATE ROTATION INPUT
-        # ----------------------------------------------------
-
-        if ([string]::IsNullOrWhiteSpace($Customer.KeyVaultName)) {
-            throw "KeyVaultName is missing."
-        }
-
-        if ([string]::IsNullOrWhiteSpace($Customer.KeyVaultSecretName)) {
-            throw "KeyVaultSecretName is missing."
         }
 
         # ----------------------------------------------------
@@ -711,25 +858,20 @@ foreach ($Customer in $EnabledCustomers) {
         # ----------------------------------------------------
 
         if ($Mode -eq "Validate") {
-
             Write-Host ""
             Write-Host "Validating Key Vault credential..."
-
             Write-Host "Checking Key Vault '$($Customer.KeyVaultName)'..."
 
-            if (-not (
-                Test-KeyVaultExists `
-                    -VaultName $Customer.KeyVaultName
-            )) {
+            if (-not (Test-KeyVaultExists -VaultName $Customer.KeyVaultName)) {
                 throw "Key Vault '$($Customer.KeyVaultName)' is not accessible."
             }
 
             Write-Host "Key Vault accessible."
-            
+
             $ValidationMetadata =
                 Get-KeyVaultSecretMetadata `
-                -VaultName $Customer.KeyVaultName `
-                -SecretName $Customer.KeyVaultSecretName
+                    -VaultName $Customer.KeyVaultName `
+                    -SecretName $Customer.KeyVaultSecretName
 
             $ValidationSecret =
                 Get-CustomerKeyVaultSecretValue `
@@ -737,7 +879,6 @@ foreach ($Customer in $EnabledCustomers) {
                     -SecretName $Customer.KeyVaultSecretName
 
             try {
-
                 $ValidationSucceeded =
                     Test-CustomerClientSecret `
                         -ApplicationId $Customer.ApplicationId `
@@ -747,19 +888,17 @@ foreach ($Customer in $EnabledCustomers) {
                     throw "Customer credential validation failed."
                 }
 
-
-
-		if (-not $ValidationSucceeded) {
-                    throw "Customer credential validation failed."
-                }
+                $ValidationStatus = "SUCCESS"
+                $ValidationDetails = "Key Vault secret authenticated successfully."
 
                 if ([string]::IsNullOrWhiteSpace($ValidationMetadata.credentialKeyId)) {
-
                     Write-Warning "Key Vault secret has no CredentialKeyId tag."
                     Write-Warning "Authentication succeeded, but credential mapping cannot be verified."
+
+                    $ValidationStatus = "WARNING"
+                    $ValidationDetails = "Authentication succeeded, but Key Vault has no CredentialKeyId tag; mapping was not verified."
                 }
                 else {
-
                     $MatchingCredentials =
                         @(
                             $Application.passwordCredentials |
@@ -785,6 +924,8 @@ foreach ($Customer in $EnabledCustomers) {
                     Write-Host "Credential: $($MatchingCredential.displayName)"
                     Write-Host "Key ID:     $($MatchingCredential.keyId)"
                     Write-Host ""
+
+                    $ValidationDetails = "Key Vault secret authenticated and mapped to '$($MatchingCredential.displayName)'."
                 }
 
                 Write-Host ""
@@ -800,34 +941,34 @@ foreach ($Customer in $EnabledCustomers) {
                     -KeyVaultName $Customer.KeyVaultName `
                     -KeyVaultSecretName $Customer.KeyVaultSecretName `
                     -Action "Validate" `
-                    -Status "Success" `
-                    -CredentialKeyId "" `
-                    -Message "Key Vault secret successfully authenticated as the target App Registration."
+                    -Status $(if ($ValidationStatus -eq "WARNING") { "Warning" } else { "Success" }) `
+                    -CredentialKeyId $(if ($ValidationMetadata.credentialKeyId) { "$($ValidationMetadata.credentialKeyId)" } else { "" }) `
+                    -Message $ValidationDetails
 
-                $SuccessCount++
+                Add-BatchResult `
+                    -RowNumber $Customer.RowNumber `
+                    -CustomerName $Customer.CustomerName `
+                    -Stage "Validate" `
+                    -Status $ValidationStatus `
+                    -CredentialKeyId $(if ($ValidationMetadata.credentialKeyId) { "$($ValidationMetadata.credentialKeyId)" } else { "" }) `
+                    -Details $ValidationDetails
             }
             finally {
-
-                # Remove plaintext reference from memory as soon as possible.
                 $ValidationSecret = $null
             }
 
             continue
         }
 
-                # ----------------------------------------------------
+        # ----------------------------------------------------
         # RETIRE OLD CREDENTIALS
         # ----------------------------------------------------
 
         if ($Mode -eq "Retire") {
-
             Write-Host ""
             Write-Host "Preparing credential retirement..."
 
-            if (-not (
-                Test-KeyVaultExists `
-                    -VaultName $Customer.KeyVaultName
-            )) {
+            if (-not (Test-KeyVaultExists -VaultName $Customer.KeyVaultName)) {
                 throw "Key Vault '$($Customer.KeyVaultName)' is not accessible."
             }
 
@@ -866,15 +1007,13 @@ foreach ($Customer in $EnabledCustomers) {
             Write-Host "Key ID:     $($CurrentCredential.keyId)"
             Write-Host ""
 
-            # Prove the Key Vault value still works before deleting anything.
-
+            # Re-validate the current Key Vault value immediately before deletion.
             $RetireSecret =
                 Get-CustomerKeyVaultSecretValue `
                     -VaultName $Customer.KeyVaultName `
                     -SecretName $Customer.KeyVaultSecretName
 
             try {
-
                 $RetireValidation =
                     Test-CustomerClientSecret `
                         -ApplicationId $Customer.ApplicationId `
@@ -887,8 +1026,7 @@ foreach ($Customer in $EnabledCustomers) {
                 Write-Host "Current Key Vault credential authentication verified."
                 Write-Host ""
 
-                $CurrentStart =
-                    [DateTimeOffset]$CurrentCredential.startDateTime
+                $CurrentStart = [DateTimeOffset]$CurrentCredential.startDateTime
 
                 $RetirementCandidates =
                     @(
@@ -901,7 +1039,6 @@ foreach ($Customer in $EnabledCustomers) {
                     )
 
                 if ($RetirementCandidates.Count -eq 0) {
-
                     Write-Host "No older rotation credentials require retirement."
 
                     Write-AuditLog `
@@ -911,10 +1048,16 @@ foreach ($Customer in $EnabledCustomers) {
                         -KeyVaultSecretName $Customer.KeyVaultSecretName `
                         -Action "Retire" `
                         -Status "NothingToRetire" `
-                        -CredentialKeyId "" `
-                        -Message "No older rotation credentials were found."
+                        -CredentialKeyId "$($CurrentCredential.keyId)" `
+                        -Message "No older rotation credentials were found. Current Key Vault credential remains protected."
 
-                    $SuccessCount++
+                    Add-BatchResult `
+                        -RowNumber $Customer.RowNumber `
+                        -CustomerName $Customer.CustomerName `
+                        -Stage "Retire" `
+                        -Status "SUCCESS" `
+                        -CredentialKeyId "$($CurrentCredential.keyId)" `
+                        -Details "Nothing to retire; current credential protected and validated."
 
                     continue
                 }
@@ -930,15 +1073,12 @@ foreach ($Customer in $EnabledCustomers) {
                 $SkippedRetirementCount = 0
 
                 foreach ($Credential in $RetirementCandidates) {
-
                     $Target =
                         "$($Customer.CustomerName): $($Credential.displayName) [$($Credential.keyId)]"
 
-                    $Action =
-                        "Retire old App Registration client secret"
+                    $Action = "Retire old App Registration client secret"
 
                     if ($PSCmdlet.ShouldProcess($Target, $Action)) {
-
                         Remove-AppRegistrationSecret `
                             -ObjectId $Application.id `
                             -KeyId $Credential.keyId `
@@ -957,7 +1097,6 @@ foreach ($Customer in $EnabledCustomers) {
                         $RetiredCount++
                     }
                     else {
-
                         Write-AuditLog `
                             -CustomerName $Customer.CustomerName `
                             -ApplicationId $Customer.ApplicationId `
@@ -972,25 +1111,52 @@ foreach ($Customer in $EnabledCustomers) {
                     }
                 }
 
-                if ($RetiredCount -gt 0) {
-                    $SuccessCount++
+                if ($WhatIfPreference) {
+                    Add-BatchResult `
+                        -RowNumber $Customer.RowNumber `
+                        -CustomerName $Customer.CustomerName `
+                        -Stage "Retire" `
+                        -Status "WHATIF" `
+                        -CredentialKeyId "$($CurrentCredential.keyId)" `
+                        -Details "Would retire $SkippedRetirementCount old credential(s); current credential protected and validated."
                 }
-                elseif ($SkippedRetirementCount -gt 0) {
-                    $SkippedCount++
+                elseif ($RetiredCount -gt 0 -and $SkippedRetirementCount -eq 0) {
+                    Add-BatchResult `
+                        -RowNumber $Customer.RowNumber `
+                        -CustomerName $Customer.CustomerName `
+                        -Stage "Retire" `
+                        -Status "SUCCESS" `
+                        -CredentialKeyId "$($CurrentCredential.keyId)" `
+                        -Details "Retired $RetiredCount old credential(s); current credential protected and validated."
+                }
+                elseif ($RetiredCount -gt 0) {
+                    Add-BatchResult `
+                        -RowNumber $Customer.RowNumber `
+                        -CustomerName $Customer.CustomerName `
+                        -Stage "Retire" `
+                        -Status "WARNING" `
+                        -CredentialKeyId "$($CurrentCredential.keyId)" `
+                        -Details "Retired $RetiredCount credential(s); $SkippedRetirementCount candidate(s) were skipped."
+                }
+                else {
+                    Add-BatchResult `
+                        -RowNumber $Customer.RowNumber `
+                        -CustomerName $Customer.CustomerName `
+                        -Stage "Retire" `
+                        -Status "SKIPPED" `
+                        -CredentialKeyId "$($CurrentCredential.keyId)" `
+                        -Details "$SkippedRetirementCount retirement candidate(s) were not removed."
                 }
             }
             finally {
-
-                # Remove plaintext Key Vault secret reference ASAP.
                 $RetireSecret = $null
             }
 
             continue
         }
 
-
         # ----------------------------------------------------
-        # WHATIF / SHOULDPROCESS
+        # ROTATE - SHOULDPROCESS / WHATIF
         # ----------------------------------------------------
 
         $Target =
@@ -1000,6 +1166,7 @@ foreach ($Customer in $EnabledCustomers) {
             "Create a new App Registration client secret and apply it to Key Vault"
 
         if (-not $PSCmdlet.ShouldProcess($Target, $Action)) {
+            $SkipStatus = if ($WhatIfPreference) { "WHATIF" } else { "SKIPPED" }
 
             Write-AuditLog `
                 -CustomerName $Customer.CustomerName `
@@ -1007,11 +1174,16 @@ foreach ($Customer in $EnabledCustomers) {
                 -KeyVaultName $Customer.KeyVaultName `
                 -KeyVaultSecretName $Customer.KeyVaultSecretName `
                 -Action "Rotate" `
-                -Status "WhatIf" `
+                -Status $(if ($WhatIfPreference) { "WhatIf" } else { "Skipped" }) `
                 -CredentialKeyId "" `
                 -Message "No changes made."
 
-            $SkippedCount++
+            Add-BatchResult `
+                -RowNumber $Customer.RowNumber `
+                -CustomerName $Customer.CustomerName `
+                -Stage "Rotate" `
+                -Status $SkipStatus `
+                -Details "No changes made."
 
             continue
         }
@@ -1023,11 +1195,7 @@ foreach ($Customer in $EnabledCustomers) {
         Write-Host ""
         Write-Host "Checking Key Vault '$($Customer.KeyVaultName)'..."
 
-        if (-not (
-            Test-KeyVaultExists `
-                -VaultName $Customer.KeyVaultName
-        )) {
-
+        if (-not (Test-KeyVaultExists -VaultName $Customer.KeyVaultName)) {
             throw "Key Vault '$($Customer.KeyVaultName)' is not accessible."
         }
 
@@ -1043,8 +1211,7 @@ foreach ($Customer in $EnabledCustomers) {
         $NewCredential =
             New-AppRegistrationSecret `
                 -ObjectId $Application.id `
-                -Headers $GraphHeaders `
-                -CustomerName $Customer.CustomerName
+                -Headers $GraphHeaders
 
         Write-Host "Created successfully:"
         Write-Host "Display name: $($NewCredential.displayName)"
@@ -1052,9 +1219,7 @@ foreach ($Customer in $EnabledCustomers) {
         Write-Host "Expiry:       $($NewCredential.endDateTime)"
         Write-Host ""
 
-        #
-        # NEVER WRITE secretText TO CONSOLE OR LOG
-        #
+        # NEVER WRITE secretText TO CONSOLE, AUDIT LOG OR SUMMARY.
 
         # ----------------------------------------------------
         # APPLY TO KEY VAULT
@@ -1063,24 +1228,21 @@ foreach ($Customer in $EnabledCustomers) {
         Write-Host "Updating Key Vault secret..."
 
         $KeyVaultResult =
-    	Set-CustomerKeyVaultSecret `
-        -VaultName $Customer.KeyVaultName `
-        -SecretName $Customer.KeyVaultSecretName `
-        -SecretValue $NewCredential.secretText `
-        -CredentialKeyId $NewCredential.keyId `
-        -CredentialDisplayName $NewCredential.displayName
-        $KeyVaultWriteSucceeded = $true
+            Set-CustomerKeyVaultSecret `
+                -VaultName $Customer.KeyVaultName `
+                -SecretName $Customer.KeyVaultSecretName `
+                -SecretValue $NewCredential.secretText `
+                -CredentialKeyId $NewCredential.keyId `
+                -CredentialDisplayName $NewCredential.displayName
 
+        $KeyVaultWriteSucceeded = $true
         Write-Host "Key Vault update returned successfully."
 
-        # ----------------------------------------------------
-        # REMOVE PLAINTEXT REFERENCE ASAP
-        # ----------------------------------------------------
-
+        # Remove the plaintext reference as soon as it is no longer needed.
         $NewCredential.secretText = $null
 
         # ----------------------------------------------------
-        # VERIFY METADATA
+        # VERIFY KEY VAULT METADATA / MAPPING TAGS
         # ----------------------------------------------------
 
         $Metadata =
@@ -1088,18 +1250,22 @@ foreach ($Customer in $EnabledCustomers) {
                 -VaultName $Customer.KeyVaultName `
                 -SecretName $Customer.KeyVaultSecretName
 
+        if ("$($Metadata.credentialKeyId)" -ne "$($NewCredential.keyId)") {
+            throw "Key Vault CredentialKeyId tag does not match the credential that was just created."
+        }
+
+        if ("$($Metadata.credentialDisplayName)" -ne "$($NewCredential.displayName)") {
+            throw "Key Vault CredentialDisplayName tag does not match the credential that was just created."
+        }
+
         Write-Host ""
         Write-Host "Key Vault secret verified:"
-        Write-Host "Name:    $($Metadata.name)"
-        Write-Host "Enabled: $($Metadata.enabled)"
-        Write-Host "Updated: $($Metadata.updated)"
+        Write-Host "Name:              $($Metadata.name)"
+        Write-Host "Enabled:           $($Metadata.enabled)"
+        Write-Host "Updated:           $($Metadata.updated)"
         Write-Host "Credential Key ID: $($Metadata.credentialKeyId)"
         Write-Host "Credential name:   $($Metadata.credentialDisplayName)"
         Write-Host ""
-
-        # ----------------------------------------------------
-        # SUCCESS LOG
-        # ----------------------------------------------------
 
         Write-AuditLog `
             -CustomerName $Customer.CustomerName `
@@ -1109,51 +1275,46 @@ foreach ($Customer in $EnabledCustomers) {
             -Action "Rotate" `
             -Status "CreatedAndApplied" `
             -CredentialKeyId $NewCredential.keyId `
-            -Message "New App Registration credential created and new Key Vault secret version applied."
+            -Message "New App Registration credential created, applied to Key Vault and mapping tags verified."
 
-        $SuccessCount++
+        Add-BatchResult `
+            -RowNumber $Customer.RowNumber `
+            -CustomerName $Customer.CustomerName `
+            -Stage "Rotate" `
+            -Status "SUCCESS" `
+            -CredentialKeyId "$($NewCredential.keyId)" `
+            -Details "New credential '$($NewCredential.displayName)' applied to Key Vault; old credentials retained."
 
         Write-Host "SUCCESS"
         Write-Host ""
         Write-Host "IMPORTANT:"
         Write-Host "Old App Registration credentials have NOT been deleted."
-        Write-Host "Application validation is still required."
-
+        Write-Host "Run Validate before Retire."
     }
     catch {
-
-        $FailureCount++
-
-        $ErrorMessage =
-            $_.Exception.Message
+        $ErrorMessage = $_.Exception.Message
 
         Write-Host ""
         Write-Host "FAILED: $ErrorMessage"
 
         if ($NewCredential -and $NewCredential.keyId) {
-
             if (-not $KeyVaultWriteSucceeded) {
-
                 Write-Host ""
                 Write-Warning "A new App Registration credential was created, but the Key Vault write did not complete."
                 Write-Warning "Attempting automatic rollback of credential $($NewCredential.keyId)..."
 
                 try {
-
                     Remove-AppRegistrationSecret `
                         -ObjectId $Application.id `
                         -KeyId $NewCredential.keyId `
                         -Headers $GraphHeaders
 
                     Write-Warning "Automatic rollback completed successfully."
-
                     $ErrorMessage =
                         "$ErrorMessage Automatic rollback removed credential $($NewCredential.keyId)."
                 }
                 catch {
-
-                    $RollbackError =
-                        $_.Exception.Message
+                    $RollbackError = $_.Exception.Message
 
                     Write-Host ""
                     Write-Error "CRITICAL: Automatic rollback failed for credential $($NewCredential.keyId). Manual cleanup is required. $RollbackError"
@@ -1163,11 +1324,10 @@ foreach ($Customer in $EnabledCustomers) {
                 }
             }
             else {
-
                 Write-Host ""
                 Write-Warning "The Key Vault write completed before the later failure."
                 Write-Warning "The new credential has been retained intentionally."
-                Write-Warning "Do NOT delete credential $($NewCredential.keyId) until the Key Vault version has been verified."
+                Write-Warning "Do NOT retire credentials for this customer until Validate succeeds."
             }
         }
 
@@ -1178,12 +1338,18 @@ foreach ($Customer in $EnabledCustomers) {
             -KeyVaultSecretName $Customer.KeyVaultSecretName `
             -Action $Mode `
             -Status "Failed" `
-            -CredentialKeyId $(if ($NewCredential) { $NewCredential.keyId } else { "" }) `
+            -CredentialKeyId $(if ($NewCredential -and $NewCredential.keyId) { "$($NewCredential.keyId)" } else { "" }) `
             -Message $ErrorMessage
+
+        Add-BatchResult `
+            -RowNumber $Customer.RowNumber `
+            -CustomerName $Customer.CustomerName `
+            -Stage $Mode `
+            -Status "FAILED" `
+            -CredentialKeyId $(if ($NewCredential -and $NewCredential.keyId) { "$($NewCredential.keyId)" } else { "" }) `
+            -Details $ErrorMessage
     }
-
     finally {
-
         if ($NewCredential) {
             $NewCredential.secretText = $null
         }
@@ -1193,38 +1359,101 @@ foreach ($Customer in $EnabledCustomers) {
 }
 
 # ============================================================
-# SUMMARY
+# BATCH SUMMARY
 # ============================================================
 
+try {
+    $script:BatchResults |
+        Sort-Object Row |
+        Export-Csv `
+            -Path $SummaryFile `
+            -NoTypeInformation `
+            -Force `
+            -WhatIf:$false
+}
+catch {
+    Write-Warning "Unable to write batch summary file: $($_.Exception.Message)"
+}
+
+$SuccessCount = @($script:BatchResults | Where-Object { $_.Status -eq "SUCCESS" }).Count
+$FailureCount = @($script:BatchResults | Where-Object { $_.Status -eq "FAILED" }).Count
+$WarningCount = @($script:BatchResults | Where-Object { $_.Status -eq "WARNING" }).Count
+$WhatIfCount = @($script:BatchResults | Where-Object { $_.Status -eq "WHATIF" }).Count
+$SkippedCount = @($script:BatchResults | Where-Object { $_.Status -eq "SKIPPED" }).Count
+$DisabledCount = @($script:BatchResults | Where-Object { $_.Status -eq "DISABLED" }).Count
+
 Write-Host ""
 Write-Host "================================================"
-Write-Host " COMPLETE"
+Write-Host " BATCH COMPLETE"
 Write-Host "================================================"
+Write-Host ""
+Write-Host "Per-customer results:"
 Write-Host ""
 
-Write-Host "Successful: $SuccessCount"
-Write-Host "Failed:     $FailureCount"
-Write-Host "Skipped:    $SkippedCount"
+$script:BatchResults |
+    Sort-Object Row |
+    Select-Object Customer, Stage, Status, CredentialKeyId, Details |
+    Format-Table -AutoSize -Wrap
+
 Write-Host ""
+Write-Host "Customers supplied:  $($NormalizedCustomers.Count)"
+Write-Host "Enabled:             $($EnabledCustomers.Count)"
+Write-Host "Disabled:            $DisabledCount"
+Write-Host "Successful:          $SuccessCount"
+Write-Host "Warnings:            $WarningCount"
+Write-Host "Failed:              $FailureCount"
+Write-Host "WhatIf:              $WhatIfCount"
+Write-Host "Skipped:             $SkippedCount"
+Write-Host ""
+
+$FailedCustomers = @($script:BatchResults | Where-Object { $_.Status -eq "FAILED" })
+
+if ($FailedCustomers.Count -gt 0) {
+    Write-Host "FAILED CUSTOMERS"
+    Write-Host ""
+
+    foreach ($Failure in $FailedCustomers) {
+        Write-Host "$($Failure.Customer) - $($Failure.Details)"
+    }
+
+    Write-Host ""
+}
+
+if ($WarningCount -gt 0) {
+    Write-Host "WARNING CUSTOMERS"
+    Write-Host ""
+
+    $script:BatchResults |
+        Where-Object { $_.Status -eq "WARNING" } |
+        ForEach-Object {
+            Write-Host "$($_.Customer) - $($_.Details)"
+        }
+
+    Write-Host ""
+}
+
 Write-Host "Audit log:"
 Write-Host $LogFile
 Write-Host ""
+Write-Host "Batch summary CSV:"
+Write-Host $SummaryFile
+Write-Host ""
 
 if ($Mode -eq "Rotate") {
-
     Write-Host "No old App Registration credentials were removed."
-    Write-Host "Run Validate before retiring an old credential."
+    Write-Host "Run Validate for the batch before running Retire."
     Write-Host ""
 }
 elseif ($Mode -eq "Validate") {
-
     Write-Host "Validation completed."
     Write-Host "No App Registration credentials were removed."
     Write-Host ""
 }
 elseif ($Mode -eq "Retire") {
-
     Write-Host "Retirement stage completed."
-    Write-Host "The credential referenced by Key Vault was protected from deletion."
+    Write-Host "Each customer's current Key Vault credential was revalidated and protected before any older rotation credential could be removed."
     Write-Host ""
 }
+
+# Clear authentication secret reference before exit.
+$AutomationClientSecret = $null
