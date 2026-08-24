@@ -194,6 +194,47 @@ function ConvertTo-EnabledFlag {
 }
 
 
+
+function Normalize-CredentialKeyIdList {
+
+    param(
+        [AllowNull()]
+        [string]$Value,
+
+        [Parameter(Mandatory)]
+        [int]$RowNumber
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
+    }
+
+    $Ids = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($RawId in ($Value -split "[;,]")) {
+        $Candidate = "$RawId".Trim()
+
+        if ([string]::IsNullOrWhiteSpace($Candidate)) {
+            continue
+        }
+
+        $ParsedKeyId = [guid]::Empty
+
+        if (-not [guid]::TryParse($Candidate, [ref]$ParsedKeyId)) {
+            throw "CSV row $RowNumber has invalid PreviousCredentialKeyIds value '$Candidate'."
+        }
+
+        $NormalizedId = $ParsedKeyId.ToString()
+
+        if ($NormalizedId -notin $Ids) {
+            $Ids.Add($NormalizedId) | Out-Null
+        }
+    }
+
+    return ($Ids -join ";")
+}
+
+
 function Get-GraphAccessToken {
 
     Write-Host "Authenticating to Microsoft Graph..."
@@ -307,6 +348,30 @@ function Show-AppCredentials {
 }
 
 
+function Get-SafeCredentialExpiry {
+
+    param(
+        [Parameter(Mandatory)]
+        [DateTime]$StartDate,
+
+        [Parameter(Mandatory)]
+        [int]$Months
+    )
+
+    # Start with the requested validity period, then move Friday/weekend
+    # expiries back to Thursday. This never extends the requested lifetime.
+    $EndDate = $StartDate.AddMonths($Months)
+
+    switch ($EndDate.DayOfWeek.ToString()) {
+        "Friday"   { $EndDate = $EndDate.AddDays(-1) }
+        "Saturday" { $EndDate = $EndDate.AddDays(-2) }
+        "Sunday"   { $EndDate = $EndDate.AddDays(-3) }
+    }
+
+    return $EndDate
+}
+
+
 function New-AppRegistrationSecret {
 
     param(
@@ -318,7 +383,7 @@ function New-AppRegistrationSecret {
     )
 
     $StartDate = (Get-Date).ToUniversalTime()
-    $EndDate = $StartDate.AddMonths($ValidityMonths)
+    $EndDate = Get-SafeCredentialExpiry -StartDate $StartDate -Months $ValidityMonths
     $RotationName = "rotation-$($StartDate.ToString('yyyyMMdd-HHmmss'))"
 
     $Body = @{
@@ -458,7 +523,16 @@ function Set-CustomerKeyVaultSecret {
         [string]$CredentialKeyId,
 
         [Parameter(Mandatory)]
-        [string]$CredentialDisplayName
+        [string]$CredentialDisplayName,
+
+        [Parameter(Mandatory)]
+        [string]$CredentialEndDateTime,
+
+        [Parameter(Mandatory)]
+        [string]$PreviousCredentialKeyIds,
+
+        [Parameter(Mandatory)]
+        [string]$PreviousCredentialSource
     )
 
     # The secret value is held in memory and passed directly to Azure CLI.
@@ -469,9 +543,13 @@ function Set-CustomerKeyVaultSecret {
             --vault-name $VaultName `
             --name $SecretName `
             --value $SecretValue `
+            --expires $CredentialEndDateTime `
             --tags `
                 "CredentialKeyId=$CredentialKeyId" `
                 "CredentialDisplayName=$CredentialDisplayName" `
+                "CredentialEndDateTime=$CredentialEndDateTime" `
+                "PreviousCredentialKeyIds=$PreviousCredentialKeyIds" `
+                "PreviousCredentialSource=$PreviousCredentialSource" `
             --output json `
             --only-show-errors
 
@@ -503,7 +581,7 @@ function Get-KeyVaultSecretMetadata {
         az keyvault secret show `
             --vault-name $VaultName `
             --name $SecretName `
-            --query "{id:id,name:name,enabled:attributes.enabled,updated:attributes.updated,credentialKeyId:tags.CredentialKeyId,credentialDisplayName:tags.CredentialDisplayName}" `
+            --query "{id:id,name:name,enabled:attributes.enabled,updated:attributes.updated,expires:attributes.expires,credentialKeyId:tags.CredentialKeyId,credentialDisplayName:tags.CredentialDisplayName,credentialEndDateTime:tags.CredentialEndDateTime,previousCredentialKeyIds:tags.PreviousCredentialKeyIds,previousCredentialSource:tags.PreviousCredentialSource}" `
             --output json `
             --only-show-errors
 
@@ -637,6 +715,19 @@ for ($Index = 0; $Index -lt $Customers.Count; $Index++) {
         $KeyVaultSecretName = if ($null -eq $Source.KeyVaultSecretName) { "" } else { "$($Source.KeyVaultSecretName)".Trim() }
         $Enabled = ConvertTo-EnabledFlag -Value $Source.Enabled -RowNumber $RowNumber
 
+        $RawPreviousCredentialKeyIds =
+            if ($Source.PSObject.Properties.Name -contains "PreviousCredentialKeyIds") {
+                if ($null -eq $Source.PreviousCredentialKeyIds) { "" } else { "$($Source.PreviousCredentialKeyIds)".Trim() }
+            }
+            else {
+                ""
+            }
+
+        $PreviousCredentialKeyIds =
+            Normalize-CredentialKeyIdList `
+                -Value $RawPreviousCredentialKeyIds `
+                -RowNumber $RowNumber
+
         if ([string]::IsNullOrWhiteSpace($CustomerName)) {
             throw "CustomerName is missing."
         }
@@ -673,6 +764,7 @@ for ($Index = 0; $Index -lt $Customers.Count; $Index++) {
                 ApplicationId      = $ApplicationId
                 KeyVaultName       = $KeyVaultName
                 KeyVaultSecretName = $KeyVaultSecretName
+                PreviousCredentialKeyIds = $PreviousCredentialKeyIds
                 Enabled            = $Enabled
             }
         ) | Out-Null
@@ -741,6 +833,7 @@ Write-Host "Total entries:     $($NormalizedCustomers.Count)"
 Write-Host "Enabled entries:   $($EnabledCustomers.Count)"
 Write-Host "Disabled entries:  $($DisabledCustomers.Count)"
 Write-Host "Secret lifetime:   $ValidityMonths months"
+Write-Host "Expiry policy:     Friday/Saturday/Sunday -> previous Thursday"
 Write-Host "CSV preflight:     PASSED"
 Write-Host ""
 
@@ -1026,20 +1119,54 @@ foreach ($Customer in $EnabledCustomers) {
                 Write-Host "Current Key Vault credential authentication verified."
                 Write-Host ""
 
-                $CurrentStart = [DateTimeOffset]$CurrentCredential.startDateTime
+                $PreviousKeyIdTag = "$($RetireMetadata.previousCredentialKeyIds)".Trim()
+
+                if (
+                    [string]::IsNullOrWhiteSpace($PreviousKeyIdTag) -or
+                    $PreviousKeyIdTag -eq "NONE"
+                ) {
+                    throw "Refusing retirement because no safely mapped PreviousCredentialKeyIds are stored in Key Vault."
+                }
+
+                $PreviousKeyIds =
+                    @(
+                        $PreviousKeyIdTag -split ";" |
+                        ForEach-Object { "$_".Trim() } |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                    )
+
+                foreach ($PreviousKeyId in $PreviousKeyIds) {
+
+                    $ParsedPreviousKeyId = [guid]::Empty
+
+                    if (-not [guid]::TryParse($PreviousKeyId, [ref]$ParsedPreviousKeyId)) {
+                        throw "Refusing retirement because PreviousCredentialKeyIds contains invalid GUID '$PreviousKeyId'."
+                    }
+
+                    if ("$PreviousKeyId" -eq "$($CurrentCredential.keyId)") {
+                        throw "Refusing retirement because the protected current credential also appears in PreviousCredentialKeyIds."
+                    }
+                }
 
                 $RetirementCandidates =
                     @(
                         $Application.passwordCredentials |
                         Where-Object {
-                            "$($_.keyId)" -ne "$($CurrentCredential.keyId)" -and
-                            $_.displayName -like "rotation-*" -and
-                            [DateTimeOffset]$_.startDateTime -lt $CurrentStart
+                            "$($_.keyId)" -in $PreviousKeyIds
                         }
                     )
 
+                $PresentPreviousIds = @($RetirementCandidates | ForEach-Object { "$($_.keyId)" })
+                $AlreadyAbsentPreviousIds = @($PreviousKeyIds | Where-Object { $_ -notin $PresentPreviousIds })
+
+                if ($AlreadyAbsentPreviousIds.Count -gt 0) {
+                    Write-Host "Previously mapped credential(s) already absent:"
+                    $AlreadyAbsentPreviousIds | ForEach-Object { Write-Host "Key ID: $_" }
+                    Write-Host ""
+                }
+
                 if ($RetirementCandidates.Count -eq 0) {
-                    Write-Host "No older rotation credentials require retirement."
+                    Write-Host "No mapped previous credentials remain to retire."
 
                     Write-AuditLog `
                         -CustomerName $Customer.CustomerName `
@@ -1049,7 +1176,7 @@ foreach ($Customer in $EnabledCustomers) {
                         -Action "Retire" `
                         -Status "NothingToRetire" `
                         -CredentialKeyId "$($CurrentCredential.keyId)" `
-                        -Message "No older rotation credentials were found. Current Key Vault credential remains protected."
+                        -Message "Mapped previous credential(s) are already absent. Current Key Vault credential remains protected."
 
                     Add-BatchResult `
                         -RowNumber $Customer.RowNumber `
@@ -1057,12 +1184,12 @@ foreach ($Customer in $EnabledCustomers) {
                         -Stage "Retire" `
                         -Status "SUCCESS" `
                         -CredentialKeyId "$($CurrentCredential.keyId)" `
-                        -Details "Nothing to retire; current credential protected and validated."
+                        -Details "Mapped previous credential(s) already absent; current credential protected and validated."
 
                     continue
                 }
 
-                Write-Host "Retirement candidates:"
+                Write-Host "Retirement candidates (exact mapped Key IDs only):"
                 Write-Host ""
 
                 $RetirementCandidates |
@@ -1092,7 +1219,7 @@ foreach ($Customer in $EnabledCustomers) {
                             -Action "Retire" `
                             -Status "Retired" `
                             -CredentialKeyId $Credential.keyId `
-                            -Message "Old rotation credential '$($Credential.displayName)' retired after current Key Vault credential validation."
+                            -Message "Mapped previous credential '$($Credential.displayName)' retired after current Key Vault credential validation."
 
                         $RetiredCount++
                     }
@@ -1202,6 +1329,94 @@ foreach ($Customer in $EnabledCustomers) {
         Write-Host "Key Vault accessible."
 
         # ----------------------------------------------------
+        # MAP THE CURRENT/PREVIOUS CREDENTIAL BEFORE ROTATION
+        # ----------------------------------------------------
+
+        $PreRotationCredentials = @($Application.passwordCredentials)
+        $PreviousCredentialKeyIds = "NONE"
+        $PreviousCredentialSource = "Unmapped"
+
+        if (-not [string]::IsNullOrWhiteSpace($Customer.PreviousCredentialKeyIds)) {
+
+            $RequestedPreviousIds =
+                @(
+                    $Customer.PreviousCredentialKeyIds -split ";" |
+                    ForEach-Object { "$_".Trim() } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                )
+
+            foreach ($RequestedId in $RequestedPreviousIds) {
+
+                $Matches =
+                    @(
+                        $PreRotationCredentials |
+                        Where-Object { "$($_.keyId)" -eq "$RequestedId" }
+                    )
+
+                if ($Matches.Count -ne 1) {
+                    throw "PreviousCredentialKeyIds contains '$RequestedId', but it does not match exactly one current App Registration credential."
+                }
+            }
+
+            $PreviousCredentialKeyIds = ($RequestedPreviousIds -join ";")
+            $PreviousCredentialSource = "CSV"
+        }
+        else {
+
+            $ExistingKeyVaultMetadata = $null
+
+            try {
+                $ExistingKeyVaultMetadata =
+                    Get-KeyVaultSecretMetadata `
+                        -VaultName $Customer.KeyVaultName `
+                        -SecretName $Customer.KeyVaultSecretName
+            }
+            catch {
+                # A missing or legacy Key Vault mapping is allowed during Rotate.
+                # The new credential can still be created; retirement will remain
+                # blocked unless the previous credential can be mapped safely.
+                $ExistingKeyVaultMetadata = $null
+            }
+
+            if (
+                $ExistingKeyVaultMetadata -and
+                -not [string]::IsNullOrWhiteSpace($ExistingKeyVaultMetadata.credentialKeyId)
+            ) {
+
+                $MappedExistingCredentials =
+                    @(
+                        $PreRotationCredentials |
+                        Where-Object {
+                            "$($_.keyId)" -eq "$($ExistingKeyVaultMetadata.credentialKeyId)"
+                        }
+                    )
+
+                if ($MappedExistingCredentials.Count -eq 1) {
+                    $PreviousCredentialKeyIds = "$($MappedExistingCredentials[0].keyId)"
+                    $PreviousCredentialSource = "KeyVaultTag"
+                }
+            }
+
+            if (
+                $PreviousCredentialKeyIds -eq "NONE" -and
+                $PreRotationCredentials.Count -eq 1
+            ) {
+                $PreviousCredentialKeyIds = "$($PreRotationCredentials[0].keyId)"
+                $PreviousCredentialSource = "SoleExistingCredential"
+            }
+        }
+
+        if ($PreviousCredentialKeyIds -eq "NONE") {
+            Write-Warning "Previous credential could not be mapped safely. Rotation may continue, but Retire will refuse to delete an old credential for this customer."
+        }
+        else {
+            Write-Host ""
+            Write-Host "Previous credential mapping:"
+            Write-Host "Key ID(s): $PreviousCredentialKeyIds"
+            Write-Host "Source:    $PreviousCredentialSource"
+        }
+
+        # ----------------------------------------------------
         # CREATE NEW APP REGISTRATION SECRET
         # ----------------------------------------------------
 
@@ -1233,7 +1448,10 @@ foreach ($Customer in $EnabledCustomers) {
                 -SecretName $Customer.KeyVaultSecretName `
                 -SecretValue $NewCredential.secretText `
                 -CredentialKeyId $NewCredential.keyId `
-                -CredentialDisplayName $NewCredential.displayName
+                -CredentialDisplayName $NewCredential.displayName `
+                -CredentialEndDateTime (([DateTimeOffset]$NewCredential.endDateTime).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ")) `
+                -PreviousCredentialKeyIds $PreviousCredentialKeyIds `
+                -PreviousCredentialSource $PreviousCredentialSource
 
         $KeyVaultWriteSucceeded = $true
         Write-Host "Key Vault update returned successfully."
@@ -1258,13 +1476,31 @@ foreach ($Customer in $EnabledCustomers) {
             throw "Key Vault CredentialDisplayName tag does not match the credential that was just created."
         }
 
+        $ExpectedEndDateTime = ([DateTimeOffset]$NewCredential.endDateTime).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+        if ("$($Metadata.credentialEndDateTime)" -ne $ExpectedEndDateTime) {
+            throw "Key Vault CredentialEndDateTime tag does not match the credential that was just created."
+        }
+
+        if ("$($Metadata.previousCredentialKeyIds)" -ne "$PreviousCredentialKeyIds") {
+            throw "Key Vault PreviousCredentialKeyIds tag does not match the pre-rotation credential mapping."
+        }
+
+        if ("$($Metadata.previousCredentialSource)" -ne "$PreviousCredentialSource") {
+            throw "Key Vault PreviousCredentialSource tag does not match the pre-rotation credential mapping source."
+        }
+
         Write-Host ""
         Write-Host "Key Vault secret verified:"
         Write-Host "Name:              $($Metadata.name)"
         Write-Host "Enabled:           $($Metadata.enabled)"
         Write-Host "Updated:           $($Metadata.updated)"
+        Write-Host "Expires:           $($Metadata.expires)"
         Write-Host "Credential Key ID: $($Metadata.credentialKeyId)"
         Write-Host "Credential name:   $($Metadata.credentialDisplayName)"
+        Write-Host "Credential expiry: $($Metadata.credentialEndDateTime)"
+        Write-Host "Previous Key ID(s): $($Metadata.previousCredentialKeyIds)"
+        Write-Host "Previous source:    $($Metadata.previousCredentialSource)"
         Write-Host ""
 
         Write-AuditLog `
