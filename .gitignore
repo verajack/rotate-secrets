@@ -2,3 +2,10 @@
 logs/
 customers.csv
 config/settings.psd1
+
+# macOS
+.DS_Store
+
+# Local script backups
+*.bak
+rotate_secrets.ps1.pre-hardened
