@@ -29,6 +29,7 @@ The clean production package should contain:
 production/
 ├── rotate_secrets.ps1
 ├── build_rotation_input.ps1
+├── customers.example.csv
 └── README.md
 ```
 
@@ -53,7 +54,11 @@ The normal workflow is:
 ```text
 build_rotation_input.ps1
         ↓
-review generated CSV
+customers-generated.csv
+        ↓
+review / select explicitly approved customer(s)
+        ↓
+customers-approved.csv
         ↓
 DISCOVER
         ↓
@@ -69,6 +74,12 @@ RETIRE -WHATIF
         ↓
 RETIRE
 ```
+
+**Important production rule:** `customers-generated.csv` is a discovery list, not an execution list.
+
+Do not point `rotate_secrets.ps1` directly at the full generated list in production. Copy only explicitly approved customer rows into `customers-approved.csv`, and run all rotation stages against that approved file.
+
+For the first production pilot, use **one customer only**.
 
 Do not skip directly from Rotate to Retire.
 
@@ -101,6 +112,7 @@ The working directory should then contain:
 ```text
 rotate_secrets.ps1
 build_rotation_input.ps1
+customers.example.csv
 README.md
 ```
 
@@ -211,6 +223,53 @@ MappingStatus
 MappingSource
 ```
 
+## Discovery list versus execution list
+
+The builder may legitimately discover many customers. That does **not** mean they should all be rotated in the same run.
+
+Treat `customers-generated.csv` as a **candidate/discovery list only**. Create a separate execution file containing only customers explicitly approved for the current change:
+
+```text
+customers-approved.csv
+```
+
+Example: select one customer from the generated list:
+
+```powershell
+$all = Import-Csv ./customers-generated.csv
+
+$all |
+    Where-Object { $_.CustomerName -eq "ACTUAL-CUSTOMER-NAME" } |
+    Select-Object CustomerName,ApplicationId,KeyVaultName,KeyVaultSecretName,Enabled |
+    Export-Csv ./customers-approved.csv -NoTypeInformation
+```
+
+Review it before use:
+
+```powershell
+Import-Csv ./customers-approved.csv | Format-Table -AutoSize
+```
+
+For the first production pilot, `customers-approved.csv` should contain **exactly one enabled customer**. Confirm that with:
+
+```powershell
+$approved = Import-Csv ./customers-approved.csv
+
+"Rows:    $($approved.Count)"
+"Enabled: $(($approved | Where-Object { $_.Enabled -match '^(true|yes|1)$' }).Count)"
+```
+
+Expected for the initial pilot:
+
+```text
+Rows:    1
+Enabled: 1
+```
+
+All subsequent stages must use the same `customers-approved.csv` file: Discover → Rotate `-WhatIf` → Rotate → Validate → Retire `-WhatIf` → Retire.
+
+This separation is an operational safety control: discovery can be broad, while execution stays deliberately narrow.
+
 ---
 
 # 6. First-Run / Bootstrap Mapping
@@ -285,14 +344,14 @@ The rotation script requires these core columns:
 CustomerName,ApplicationId,KeyVaultName,KeyVaultSecretName,Enabled
 ```
 
-Example:
+Example approved execution file:
 
 ```csv
 CustomerName,ApplicationId,KeyVaultName,KeyVaultSecretName,Enabled
 CustomerA,11111111-1111-1111-1111-111111111111,customer-a-kv,CustomerA-ClientSecret,true
-CustomerB,22222222-2222-2222-2222-222222222222,customer-b-kv,CustomerB-ClientSecret,true
-CustomerC,33333333-3333-3333-3333-333333333333,customer-c-kv,CustomerC-ClientSecret,false
 ```
+
+The production package also includes `customers.example.csv` with one disabled placeholder row. It is documentation only and must not be treated as a real customer input file.
 
 `Enabled` determines whether the row is processed.
 
@@ -364,7 +423,7 @@ Run Discover first:
 ```powershell
 ./rotate_secrets.ps1 `
     -Mode Discover `
-    -InputFile ./customers-generated.csv
+    -InputFile ./customers-approved.csv
 ```
 
 Discover does not create or delete credentials.
@@ -389,7 +448,7 @@ Always preview the production batch:
 ```powershell
 ./rotate_secrets.ps1 `
     -Mode Rotate `
-    -InputFile ./customers-generated.csv `
+    -InputFile ./customers-approved.csv `
     -WhatIf
 ```
 
@@ -419,7 +478,7 @@ After reviewing the dry run:
 ```powershell
 ./rotate_secrets.ps1 `
     -Mode Rotate `
-    -InputFile ./customers-generated.csv
+    -InputFile ./customers-approved.csv
 ```
 
 For the first production runs, leave confirmation prompts enabled.
@@ -429,7 +488,7 @@ For a fully reviewed larger batch:
 ```powershell
 ./rotate_secrets.ps1 `
     -Mode Rotate `
-    -InputFile ./customers-generated.csv `
+    -InputFile ./customers-approved.csv `
     -Confirm:$false
 ```
 
@@ -452,6 +511,36 @@ For each enabled customer:
 11. Adds the outcome to the audit and batch summary.
 
 The client-secret value is never written to the normal console output or audit CSV.
+
+## Azure propagation safeguard after Key Vault update
+
+Azure Key Vault can briefly return stale metadata immediately after a successful secret-version write.
+
+The production script therefore does **not** fail on the first metadata mismatch. It retries the Key Vault metadata read with bounded backoff and continues only when the expected mapping is confirmed.
+
+The retry sequence is approximately:
+
+```text
+immediate check
+2 seconds
+4 seconds
+8 seconds
+10 seconds
+```
+
+Verification remains strict. Rotate is reported as `SUCCESS` only when all expected values match:
+
+```text
+CredentialKeyId
+CredentialDisplayName
+CredentialEndDateTime
+PreviousCredentialKeyIds
+PreviousCredentialSource
+```
+
+`CredentialEndDateTime` is compared as a UTC timestamp rather than by its displayed string format. This avoids false failures when two equivalent timestamps are rendered differently by PowerShell/Azure CLI.
+
+If the metadata still cannot be verified after all retries, the customer is reported as `FAILED`. The new credential and Key Vault write are retained, the old credential is **not** removed, and the operator must run Validate before considering retirement.
 
 ---
 
@@ -561,7 +650,7 @@ After Rotate:
 ```powershell
 ./rotate_secrets.ps1 `
     -Mode Validate `
-    -InputFile ./customers-generated.csv
+    -InputFile ./customers-approved.csv
 ```
 
 Validate:
@@ -608,7 +697,7 @@ After successful validation:
 ```powershell
 ./rotate_secrets.ps1 `
     -Mode Retire `
-    -InputFile ./customers-generated.csv `
+    -InputFile ./customers-approved.csv `
     -WhatIf
 ```
 
@@ -643,7 +732,7 @@ Once `Retire -WhatIf` has been reviewed:
 ```powershell
 ./rotate_secrets.ps1 `
     -Mode Retire `
-    -InputFile ./customers-generated.csv
+    -InputFile ./customers-approved.csv
 ```
 
 For an already reviewed bulk batch:
@@ -651,7 +740,7 @@ For an already reviewed bulk batch:
 ```powershell
 ./rotate_secrets.ps1 `
     -Mode Retire `
-    -InputFile ./customers-generated.csv `
+    -InputFile ./customers-approved.csv `
     -Confirm:$false
 ```
 
@@ -662,8 +751,32 @@ Before deletion for each customer, Retire:
 3. retrieves the current Key Vault secret
 4. authenticates with it again
 5. locates only the exact mapped previous Key ID(s)
-6. removes those mapped previous credentials
-7. records the result
+6. submits the exact old Key ID for removal
+7. re-reads the App Registration and verifies that exact Key ID is actually absent
+8. retries the verification with bounded backoff if Microsoft Graph still briefly shows the removed credential
+9. records `SUCCESS` only after the retirement is confirmed
+
+## Microsoft Graph retirement propagation safeguard
+
+Microsoft Graph can accept `removePassword` successfully but continue returning the removed credential for a short period.
+
+The production script therefore treats the first response as a **removal request accepted**, not proof that retirement has fully propagated.
+
+It re-queries the App Registration and verifies that the exact retired Key ID has disappeared. If the old Key ID is still visible, it retries with bounded backoff.
+
+Typical console output can look like:
+
+```text
+Removal request accepted for credential <OLD-KEY-ID>
+Credential still visible; verifying retirement again in 2 second(s)...
+Credential still visible; verifying retirement again in 4 second(s)...
+Credential still visible; verifying retirement again in 8 second(s)...
+Credential retirement verified on attempt 4.
+```
+
+Only after the exact Key ID is absent does Retire report `SUCCESS`.
+
+The protected current credential is never selected for retirement.
 
 ---
 
@@ -672,7 +785,7 @@ Before deletion for each customer, Retire:
 For an independent verification:
 
 ```powershell
-$customers = Import-Csv ./customers-generated.csv
+$customers = Import-Csv ./customers-approved.csv
 
 foreach ($customer in $customers) {
 
@@ -820,9 +933,11 @@ For the initial production pilot:
 - [ ] Confirm the production scripts are the current Git versions.
 - [ ] Confirm Graph authentication is configured.
 - [ ] Confirm Azure CLI tenant/subscription.
-- [ ] Run `build_rotation_input.ps1`.
+- [ ] Run `build_rotation_input.ps1` to create `customers-generated.csv`.
 - [ ] Review all `Mapped`, `NotFound` and `Ambiguous` rows.
 - [ ] For first-run unmapped customers, fill in `KeyVaultName` and `KeyVaultSecretName` manually.
+- [ ] Create `customers-approved.csv` containing only explicitly approved customer(s).
+- [ ] For the initial production pilot, confirm `customers-approved.csv` contains exactly one enabled customer.
 - [ ] Set `Enabled=true` only after the mapping is confirmed.
 
 ## Discover
@@ -875,32 +990,32 @@ Typical recurring process:
     -OutputFile ./customers-generated.csv
 ```
 
-Review the generated list.
+Review the generated list, select only explicitly approved customer(s), and create `customers-approved.csv`. For the initial production pilot, this should be one customer only.
 
 Then:
 
 ```powershell
-./rotate_secrets.ps1 -Mode Discover -InputFile ./customers-generated.csv
+./rotate_secrets.ps1 -Mode Discover -InputFile ./customers-approved.csv
 ```
 
 ```powershell
-./rotate_secrets.ps1 -Mode Rotate -InputFile ./customers-generated.csv -WhatIf
+./rotate_secrets.ps1 -Mode Rotate -InputFile ./customers-approved.csv -WhatIf
 ```
 
 ```powershell
-./rotate_secrets.ps1 -Mode Rotate -InputFile ./customers-generated.csv
+./rotate_secrets.ps1 -Mode Rotate -InputFile ./customers-approved.csv
 ```
 
 ```powershell
-./rotate_secrets.ps1 -Mode Validate -InputFile ./customers-generated.csv
+./rotate_secrets.ps1 -Mode Validate -InputFile ./customers-approved.csv
 ```
 
 ```powershell
-./rotate_secrets.ps1 -Mode Retire -InputFile ./customers-generated.csv -WhatIf
+./rotate_secrets.ps1 -Mode Retire -InputFile ./customers-approved.csv -WhatIf
 ```
 
 ```powershell
-./rotate_secrets.ps1 -Mode Retire -InputFile ./customers-generated.csv
+./rotate_secrets.ps1 -Mode Retire -InputFile ./customers-approved.csv
 ```
 
 ---
@@ -908,19 +1023,21 @@ Then:
 # 26. Golden Rules
 
 1. **Always confirm tenant and subscription first.**
-2. **Always review the generated input CSV.**
-3. **Never guess an unknown Key Vault mapping.**
-4. **Always run Discover before Rotate.**
-5. **Always run Rotate with `-WhatIf` first.**
-6. **Never delete the previous credential during Rotate.**
-7. **Always Validate the replacement credential.**
-8. **Always run Retire with `-WhatIf` first.**
-9. **Retire by exact mapped Key ID, never by display-name pattern alone.**
-10. **Never expose client-secret values in Git, CSVs, logs or console output.**
-11. **One customer failure should not stop other valid customers.**
-12. **A dangerous CSV configuration should stop the batch before changes begin.**
-13. **Use `-Confirm:$false` only after the batch has already been reviewed.**
-14. **Keep the production working copy under persistent Cloud Shell storage.**
+2. **Treat the generated CSV as discovery only; rotate only from a separate approved execution CSV.**
+3. **For the initial production pilot, use exactly one enabled customer.**
+4. **Never guess an unknown Key Vault mapping.**
+5. **Always run Discover before Rotate.**
+6. **Always run Rotate with `-WhatIf` first.**
+7. **Never delete the previous credential during Rotate.**
+8. **Always Validate the replacement credential.**
+9. **Always run Retire with `-WhatIf` first.**
+10. **Retire by exact mapped Key ID, never by display-name pattern alone.**
+11. **Never expose client-secret values in Git, CSVs, logs or console output.**
+12. **One customer failure should not stop other valid customers.**
+13. **A dangerous CSV configuration should stop the batch before changes begin.**
+14. **Use `-Confirm:$false` only after the batch has already been reviewed.**
+15. **Do not treat a successful Azure write/delete request as final until the script's propagation verification succeeds.**
+16. **Keep the production working copy under persistent Cloud Shell storage.**
 
 The objective is not simply to create another secret.
 
