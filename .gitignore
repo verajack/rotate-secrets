@@ -13,3 +13,17 @@ rotate_secrets.ps1.pre-hardened
 # Generated prod-mimic lab data
 customers-prod-mimic.csv
 prod-mimic-manifest.json
+
+# Runtime / generated customer files
+customers-generated.csv
+customers-approved.csv
+customers-regression*.csv
+customers-auto-test.csv
+
+# Runtime logs
+logs/
+production/logs/
+production/customers-generated.csv
+production/customers-approved.csv
+production/customers-regression*.csv
+production/customers-auto-test.csv

@@ -1,0 +1,2 @@
+CustomerName,ApplicationId,KeyVaultName,KeyVaultSecretName,Enabled
+ExampleCustomer,00000000-0000-0000-0000-000000000000,example-keyvault,Example-ClientSecret,false
