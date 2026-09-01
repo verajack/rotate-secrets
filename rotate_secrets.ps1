@@ -440,7 +440,7 @@ function Remove-AppRegistrationSecret {
         -Headers $Headers `
         -Body $Body
 
-    Write-Host "Successfully removed credential $KeyId"
+    Write-Host "Removal request accepted for credential $KeyId"
 }
 
 
@@ -1211,6 +1211,57 @@ foreach ($Customer in $EnabledCustomers) {
                             -KeyId $Credential.keyId `
                             -Headers $GraphHeaders
 
+                        # Microsoft Graph can briefly return the removed password
+                        # credential after removePassword succeeds. Do not report
+                        # retirement as SUCCESS until the exact Key ID is absent.
+                        $RetirementVerificationDelaysSeconds = @(0, 2, 4, 8, 10)
+                        $RetirementVerified = $false
+
+                        for (
+                            $RetirementVerificationAttempt = 0;
+                            $RetirementVerificationAttempt -lt $RetirementVerificationDelaysSeconds.Count;
+                            $RetirementVerificationAttempt++
+                        ) {
+                            $RetirementDelaySeconds =
+                                $RetirementVerificationDelaysSeconds[$RetirementVerificationAttempt]
+
+                            if ($RetirementDelaySeconds -gt 0) {
+                                Write-Host "Credential still visible; verifying retirement again in $RetirementDelaySeconds second(s)..."
+                                Start-Sleep -Seconds $RetirementDelaySeconds
+                            }
+
+                            $PostRetireApplication =
+                                Get-ApplicationByClientId `
+                                    -ApplicationId $Customer.ApplicationId `
+                                    -Headers $GraphHeaders
+
+                            $StillPresent =
+                                @(
+                                    $PostRetireApplication.passwordCredentials |
+                                    Where-Object {
+                                        "$($_.keyId)" -eq "$($Credential.keyId)"
+                                    }
+                                )
+
+                            if ($StillPresent.Count -eq 0) {
+                                $RetirementVerified = $true
+
+                                if ($RetirementVerificationAttempt -gt 0) {
+                                    Write-Host "Credential retirement verified on attempt $($RetirementVerificationAttempt + 1)."
+                                }
+                                else {
+                                    Write-Host "Credential retirement verified."
+                                }
+
+                                $Application = $PostRetireApplication
+                                break
+                            }
+                        }
+
+                        if (-not $RetirementVerified) {
+                            throw "Credential '$($Credential.displayName)' [$($Credential.keyId)] is still visible after $($RetirementVerificationDelaysSeconds.Count) retirement verification attempts."
+                        }
+
                         Write-AuditLog `
                             -CustomerName $Customer.CustomerName `
                             -ApplicationId $Customer.ApplicationId `
@@ -1219,7 +1270,7 @@ foreach ($Customer in $EnabledCustomers) {
                             -Action "Retire" `
                             -Status "Retired" `
                             -CredentialKeyId $Credential.keyId `
-                            -Message "Mapped previous credential '$($Credential.displayName)' retired after current Key Vault credential validation."
+                            -Message "Mapped previous credential '$($Credential.displayName)' retired and independently verified absent after current Key Vault credential validation."
 
                         $RetiredCount++
                     }
@@ -1462,32 +1513,121 @@ foreach ($Customer in $EnabledCustomers) {
         # ----------------------------------------------------
         # VERIFY KEY VAULT METADATA / MAPPING TAGS
         # ----------------------------------------------------
+        #
+        # Azure can briefly return the previous secret version immediately
+        # after a successful write. Retry the metadata read with bounded
+        # backoff before treating an exact mapping mismatch as a failure.
+        #
+        # Verification remains strict: every expected tag must match exactly.
 
-        $Metadata =
-            Get-KeyVaultSecretMetadata `
-                -VaultName $Customer.KeyVaultName `
-                -SecretName $Customer.KeyVaultSecretName
+        $ExpectedEndDateTime =
+            ([DateTimeOffset]$NewCredential.endDateTime).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-        if ("$($Metadata.credentialKeyId)" -ne "$($NewCredential.keyId)") {
-            throw "Key Vault CredentialKeyId tag does not match the credential that was just created."
+        $VerificationDelaysSeconds = @(0, 2, 4, 8, 10)
+        $Metadata = $null
+        $MetadataVerified = $false
+        $LastMetadataMismatch = ""
+
+        for (
+            $VerificationAttempt = 0;
+            $VerificationAttempt -lt $VerificationDelaysSeconds.Count;
+            $VerificationAttempt++
+        ) {
+            $DelaySeconds = $VerificationDelaysSeconds[$VerificationAttempt]
+
+            if ($DelaySeconds -gt 0) {
+                Write-Host "Key Vault metadata not yet consistent; retrying in $DelaySeconds second(s)..."
+                Start-Sleep -Seconds $DelaySeconds
+            }
+
+            try {
+                $Metadata =
+                    Get-KeyVaultSecretMetadata `
+                        -VaultName $Customer.KeyVaultName `
+                        -SecretName $Customer.KeyVaultSecretName
+            }
+            catch {
+                $LastMetadataMismatch =
+                    "Metadata read failed: $($_.Exception.Message)"
+                continue
+            }
+
+            $MismatchReasons = [System.Collections.Generic.List[string]]::new()
+
+            if ("$($Metadata.credentialKeyId)" -ne "$($NewCredential.keyId)") {
+                $MismatchReasons.Add(
+                    "CredentialKeyId expected '$($NewCredential.keyId)' but read '$($Metadata.credentialKeyId)'"
+                ) | Out-Null
+            }
+
+            if ("$($Metadata.credentialDisplayName)" -ne "$($NewCredential.displayName)") {
+                $MismatchReasons.Add(
+                    "CredentialDisplayName expected '$($NewCredential.displayName)' but read '$($Metadata.credentialDisplayName)'"
+                ) | Out-Null
+            }
+
+            $ExpectedCredentialEnd =
+                [DateTimeOffset]::Parse(
+                    $ExpectedEndDateTime,
+                    [System.Globalization.CultureInfo]::InvariantCulture
+                ).ToUniversalTime()
+
+            $ActualCredentialEnd = $null
+            $CredentialEndParsed = $false
+
+            try {
+                $ActualCredentialEnd =
+                    ([DateTimeOffset]$Metadata.credentialEndDateTime).ToUniversalTime()
+                $CredentialEndParsed = $true
+            }
+            catch {
+                $CredentialEndParsed = $false
+            }
+
+            if (
+                -not $CredentialEndParsed -or
+                $ActualCredentialEnd -ne $ExpectedCredentialEnd
+            ) {
+                $ActualEndForMessage =
+                    if ($CredentialEndParsed) {
+                        $ActualCredentialEnd.ToString("yyyy-MM-ddTHH:mm:ssZ")
+                    }
+                    else {
+                        "$($Metadata.credentialEndDateTime)"
+                    }
+
+                $MismatchReasons.Add(
+                    "CredentialEndDateTime expected '$ExpectedEndDateTime' but read '$ActualEndForMessage'"
+                ) | Out-Null
+            }
+
+            if ("$($Metadata.previousCredentialKeyIds)" -ne "$PreviousCredentialKeyIds") {
+                $MismatchReasons.Add(
+                    "PreviousCredentialKeyIds expected '$PreviousCredentialKeyIds' but read '$($Metadata.previousCredentialKeyIds)'"
+                ) | Out-Null
+            }
+
+            if ("$($Metadata.previousCredentialSource)" -ne "$PreviousCredentialSource") {
+                $MismatchReasons.Add(
+                    "PreviousCredentialSource expected '$PreviousCredentialSource' but read '$($Metadata.previousCredentialSource)'"
+                ) | Out-Null
+            }
+
+            if ($MismatchReasons.Count -eq 0) {
+                $MetadataVerified = $true
+
+                if ($VerificationAttempt -gt 0) {
+                    Write-Host "Key Vault metadata verification succeeded on attempt $($VerificationAttempt + 1)."
+                }
+
+                break
+            }
+
+            $LastMetadataMismatch = $MismatchReasons -join "; "
         }
 
-        if ("$($Metadata.credentialDisplayName)" -ne "$($NewCredential.displayName)") {
-            throw "Key Vault CredentialDisplayName tag does not match the credential that was just created."
-        }
-
-        $ExpectedEndDateTime = ([DateTimeOffset]$NewCredential.endDateTime).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
-
-        if ("$($Metadata.credentialEndDateTime)" -ne $ExpectedEndDateTime) {
-            throw "Key Vault CredentialEndDateTime tag does not match the credential that was just created."
-        }
-
-        if ("$($Metadata.previousCredentialKeyIds)" -ne "$PreviousCredentialKeyIds") {
-            throw "Key Vault PreviousCredentialKeyIds tag does not match the pre-rotation credential mapping."
-        }
-
-        if ("$($Metadata.previousCredentialSource)" -ne "$PreviousCredentialSource") {
-            throw "Key Vault PreviousCredentialSource tag does not match the pre-rotation credential mapping source."
+        if (-not $MetadataVerified) {
+            throw "Key Vault metadata verification failed after $($VerificationDelaysSeconds.Count) attempts. Last observed mismatch: $LastMetadataMismatch"
         }
 
         Write-Host ""
